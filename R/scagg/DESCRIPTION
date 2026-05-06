@@ -1,0 +1,26 @@
+Package: scagg
+Type: Package
+Title: Pseudobulk and Metacell Aggregation for Single-Cell RNA-seq
+Version: 0.1.0
+Date: 2026-05-06
+Authors@R: person("Ethan", "Fenton",
+                  email = "ethanfenton27@gmail.com",
+                  role  = c("aut", "cre"))
+Description: Provides three aggregation strategies for single-cell RNA-seq
+    Seurat objects: (1) true pseudobulk aggregation (one sample per unique
+    group combination), (2) metacell creation by target cell size, and (3)
+    metacell creation by target metacell count per group. All functions
+    accept user-specified grouping and metadata variables and produce a full
+    cell-to-metacell traceability table.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Imports:
+    dplyr,
+    utils
+Suggests:
+    Seurat,
+    testthat (>= 3.0.0)
+URL: https://github.com/ethanfenton/scagg
+BugReports: https://github.com/ethanfenton/scagg/issues
