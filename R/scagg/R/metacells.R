@@ -100,6 +100,10 @@
 #' @param seed Integer random seed (default 42).
 #' @param save_membership If non-NULL, path to save a CSV mapping each cell
 #'   barcode to its metacell ID.
+#' @param idents_col Name of the metadata column to set as the active
+#'   \code{Idents} of the returned Seurat object (e.g. \code{"cell_type"} or
+#'   a derived column like \code{"time_treat"}).  \code{NULL} (default) leaves
+#'   Idents unchanged.
 #'
 #' @return A named list with:
 #'   \describe{
@@ -112,7 +116,8 @@
 #' \dontrun{
 #' res <- make_metacells_by_size(
 #'   so, group_vars = c("cell_type", "sample"),
-#'   cell_size = 10, save_membership = "metacell_membership.csv"
+#'   cell_size = 10, idents_col = "cell_type",
+#'   save_membership = "metacell_membership.csv"
 #' )
 #' seurat_mc <- res$obj
 #' }
@@ -126,7 +131,8 @@ make_metacells_by_size <- function(
     meta_vars   = NULL,
     assays      = "SCT",
     seed        = 42L,
-    save_membership = NULL
+    save_membership = NULL,
+    idents_col  = NULL
 ) {
   if (is.null(cell_min)) cell_min <- .default_cell_min(cell_size)
   if (is.null(meta_vars)) {
@@ -149,7 +155,7 @@ make_metacells_by_size <- function(
   mdata <- .assign_metacells(mdata, group_vars, labels_fn, seed)
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
 }
 
 
@@ -166,6 +172,8 @@ make_metacells_by_size <- function(
 #' @param assays Seurat assay(s) to aggregate.
 #' @param seed Random seed.
 #' @param save_membership Path for membership CSV.
+#' @param idents_col Metadata column to set as active Idents. \code{NULL}
+#'   (default) leaves Idents unchanged.
 #'
 #' @return Named list with \code{obj} (Seurat) and \code{membership} (data.frame).
 #'
@@ -173,7 +181,7 @@ make_metacells_by_size <- function(
 #' \dontrun{
 #' res <- make_metacells_by_num(
 #'   so, group_vars = c("cell_type", "sample"),
-#'   n_metacells = 10
+#'   n_metacells = 10, idents_col = "cell_type"
 #' )
 #' }
 #'
@@ -186,7 +194,8 @@ make_metacells_by_num <- function(
     meta_vars   = NULL,
     assays      = "SCT",
     seed        = 42L,
-    save_membership = NULL
+    save_membership = NULL,
+    idents_col  = NULL
 ) {
   if (is.null(meta_vars)) {
     meta_vars <- setdiff(colnames(so_obj@meta.data), group_vars)
@@ -208,7 +217,7 @@ make_metacells_by_num <- function(
   mdata <- .assign_metacells(mdata, group_vars, labels_fn, seed)
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
 }
 
 
@@ -223,6 +232,8 @@ make_metacells_by_num <- function(
 #' @param meta_vars Metadata columns to carry forward.
 #' @param assays Seurat assay(s) to aggregate.
 #' @param save_membership Path for membership CSV.
+#' @param idents_col Metadata column to set as active Idents. \code{NULL}
+#'   (default) leaves Idents unchanged.
 #'
 #' @return Named list with \code{obj} and \code{membership}.
 #'
@@ -230,7 +241,7 @@ make_metacells_by_num <- function(
 #' \dontrun{
 #' res <- make_pseudobulk(
 #'   so, group_vars = c("sample", "cell_type"),
-#'   assays = c("SCT", "RNA")
+#'   assays = c("SCT", "RNA"), idents_col = "sample"
 #' )
 #' }
 #'
@@ -240,7 +251,8 @@ make_pseudobulk <- function(
     group_vars,
     meta_vars   = NULL,
     assays      = "SCT",
-    save_membership = NULL
+    save_membership = NULL,
+    idents_col  = NULL
 ) {
   if (is.null(meta_vars)) {
     meta_vars <- setdiff(colnames(so_obj@meta.data), group_vars)
@@ -253,14 +265,28 @@ make_pseudobulk <- function(
   )
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
 }
 
 
 # ── Shared finaliser ──────────────────────────────────────────────────────────
 
-.finish <- function(so_obj, group_vars, meta_vars, assays, save_membership, mdata) {
+.finish <- function(so_obj, group_vars, meta_vars, assays,
+                    save_membership, mdata, idents_col) {
   mc_so <- .aggregate_and_meta(so_obj, group_vars, meta_vars, assays)
+
+  # Optionally set active Idents
+  if (!is.null(idents_col)) {
+    if (!idents_col %in% colnames(mc_so@meta.data)) {
+      warning(sprintf(
+        "[scagg] idents_col '%s' not found in metacell metadata; Idents not set.",
+        idents_col
+      ))
+    } else {
+      Seurat::Idents(mc_so) <- idents_col
+      message("[scagg] Idents set to '", idents_col, "'")
+    }
+  }
 
   # Build membership table
   membership <- mdata

@@ -179,12 +179,18 @@ scagg.make_metacells_by_num(adata, group_vars, n_metacells, *, min_cells, meta_v
 ### R
 
 ```
-make_pseudobulk(so_obj, group_vars, meta_vars, assays, save_membership)
+make_pseudobulk(so_obj, group_vars, meta_vars, assays, save_membership,
+                idents_col = NULL)
 make_metacells_by_size(so_obj, group_vars, cell_size, cell_min, meta_vars,
-                       assays, seed, save_membership)
+                       assays, seed, save_membership, idents_col = NULL)
 make_metacells_by_num(so_obj, group_vars, n_metacells, min_cells, meta_vars,
-                      assays, seed, save_membership)
+                      assays, seed, save_membership, idents_col = NULL)
 ```
+
+`idents_col`: name of any column in the result's metadata to set as the active
+Seurat `Idents`. `NULL` (default) leaves Idents unset. The column can be a
+pre-existing metadata column (e.g. `"cell_type"`) or one you derive after
+aggregation:
 
 All R functions return a named list:
 - `$obj` — aggregated Seurat object
@@ -232,10 +238,10 @@ counts layer for biologically meaningful aggregation.
 ## Migrating from your existing code
 
 If you were using `make_metacells_by_size(so_obj, cell_size=10)` with
-hardcoded `ct3`/`sample` columns:
+hardcoded `ct3`/`sample` columns and a hardcoded `time_treat` Idents:
 
 ```r
-# Old (hardcoded)
+# Old (hardcoded ct3/sample, hardcoded time_treat Idents)
 metacell_so <- make_metacells_by_size(so_obj, cell_size = 10)
 
 # New (scagg, generalised)
@@ -247,8 +253,19 @@ res <- make_metacells_by_size(
   assays     = "SCT"
 )
 metacell_so <- res$obj
-# Add any derived columns you need:
+
+# Add a derived column, then point Idents at it
 metacell_so$time_treat <- paste(metacell_so$Timepoint, metacell_so$Treatment, sep = "_")
+Seurat::Idents(metacell_so) <- "time_treat"
+
+# OR — pass idents_col directly if the column already exists in meta_vars:
+res <- make_metacells_by_size(
+  so_obj,
+  group_vars = c("ct3", "sample"),
+  cell_size  = 10,
+  meta_vars  = c("Treatment", "Timepoint", "sex", "Prepper"),
+  idents_col = "ct3"   # set Idents to cell type
+)
 ```
 
 ---
