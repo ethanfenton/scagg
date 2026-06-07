@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scagg"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pseudobulk and metacell aggregation for single-cell RNA-seq (AnnData / scanpy)"
 readme = "README.md"
 license = { text = "MIT" }
