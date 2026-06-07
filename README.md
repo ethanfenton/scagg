@@ -40,6 +40,29 @@ remotes::install_github("ethanfenton/scagg", subdir = "R/scagg")
 
 Requirements: Seurat, dplyr.
 
+### Docker
+
+No Python environment needed — mount your data directory and run:
+
+```bash
+docker pull ghcr.io/ethanfenton/scagg:latest
+
+docker run --rm \
+  -v /path/to/your/data:/data \
+  ghcr.io/ethanfenton/scagg:latest \
+  pseudobulk \
+  --input  /data/input.h5ad \
+  --output /data/output.h5ad \
+  --group-vars cell_type sample
+
+# All sub-commands work the same way
+docker run --rm -v $(pwd):/data ghcr.io/ethanfenton/scagg:latest --help
+```
+
+The `/data` mount is where input and output files must live — paths inside the
+container must start with `/data/`.  Versioned images are available as
+`ghcr.io/ethanfenton/scagg:0.1.2`, etc.
+
 ---
 
 ## Quick start — Python
