@@ -23,8 +23,53 @@
   mdata
 }
 
+# Validate `method`; return the embedding matrix (rows = cells) or NULL.
+.get_embedding <- function(so_obj, method, reduction, n_dims) {
+  if (method == "random") return(NULL)
+  if (!reduction %in% Seurat::Reductions(so_obj)) {
+    stop(sprintf(
+      "[scagg] reduction '%s' not found (available: %s). Run e.g. RunPCA() first.",
+      reduction, paste(Seurat::Reductions(so_obj), collapse = ", ")))
+  }
+  emb <- Seurat::Embeddings(so_obj, reduction = reduction)[colnames(so_obj), , drop = FALSE]
+  if (!is.null(n_dims)) {
+    if (n_dims < 1L) stop("[scagg] n_dims must be >= 1")
+    emb <- emb[, seq_len(min(n_dims, ncol(emb))), drop = FALSE]
+  }
+  if (any(!is.finite(emb))) stop("[scagg] embedding contains NA or infinite values")
+  emb
+}
+
+# Metacell labels 1..n_mc for the cells `idx` of one group.
+.group_labels <- function(idx, n_mc, emb, refine, n_init_pcs) {
+  if (is.null(emb)) return(sample(rep(seq_len(n_mc), length.out = length(idx))))
+  .balanced_partition(emb[idx, , drop = FALSE], n_mc, refine = refine,
+                      n_init_pcs = n_init_pcs)
+}
+
+# Per-metacell compactness, plus a log line comparing it to random metacells
+# of the same sizes.  Returns data.frame(metacell_id, compactness).
+.compactness_table <- function(mdata, emb, group_vars, seed) {
+  keep <- mdata$metacell_id != "unassigned"
+  ids  <- mdata$metacell_id[keep]
+  sub  <- emb[keep, , drop = FALSE]
+  comp <- .compactness(sub, ids)
+
+  set.seed(seed)
+  strata <- interaction(mdata[keep, group_vars, drop = FALSE], drop = TRUE)
+  shuffled <- ids
+  for (rows in split(seq_along(ids), strata)) shuffled[rows] <- sample(ids[rows])
+  message(sprintf(
+    "[scagg] median metacell compactness: %.3g (random metacells of the same sizes: %.3g)",
+    stats::median(comp), stats::median(.compactness(sub, shuffled))))
+
+  data.frame(metacell_id = names(comp), compactness = unname(comp),
+             stringsAsFactors = FALSE)
+}
+
 # Aggregate a Seurat object and attach clean metadata.
-.aggregate_and_meta <- function(so_obj, group_vars, meta_vars, assays) {
+.aggregate_and_meta <- function(so_obj, group_vars, meta_vars, assays,
+                                extra_meta = NULL) {
   mdata <- so_obj@meta.data
 
   # Filter out unassigned cells
@@ -63,17 +108,31 @@
 
   # Join to AggregateExpression metadata
   mc_mdata_agg$metacell_id <- rownames(mc_mdata_agg)
+  if (!is.null(extra_meta)) {
+    mc_mdata_agg <- dplyr::left_join(mc_mdata_agg, extra_meta, by = "metacell_id")
+  }
 
-  # AggregateExpression uses "-" instead of "_" in cell names; normalise
-  mc_so@meta.data$metacell_id <- rownames(mc_so@meta.data)
+  # Seurat v5's AggregateExpression replaces "_" with "-" in group names, so
+  # map its column names back to the original metacell IDs before joining.
+  agg_names <- rownames(mc_so@meta.data)
+  orig_ids  <- mc_mdata_agg$metacell_id
+  id_map    <- c(stats::setNames(orig_ids, orig_ids),
+                 stats::setNames(orig_ids, gsub("_", "-", orig_ids, fixed = TRUE)))
+  id_map    <- id_map[!duplicated(names(id_map))]
+  mc_so@meta.data$metacell_id <- unname(id_map[agg_names])
+  if (anyNA(mc_so@meta.data$metacell_id)) {
+    warning("[scagg] some aggregated metacells could not be matched to their ",
+            "metadata; their metadata columns will be NA.")
+  }
 
-  # Merge
+  # Merge (left_join keeps row order, so the Seurat cell names stay valid)
   merged <- dplyr::left_join(
     mc_so@meta.data,
     mc_mdata_agg,
-    by = "metacell_id"
+    by = "metacell_id",
+    suffix = c("", ".scagg")
   )
-  rownames(merged) <- merged$metacell_id
+  rownames(merged) <- agg_names
   mc_so@meta.data  <- merged
 
   mc_so
@@ -84,9 +143,12 @@
 
 #' Aggregate cells into metacells of approximately \code{cell_size} cells
 #'
-#' Within each combination of \code{group_vars}, cells are shuffled then
-#' assigned round-robin to \code{floor(n / cell_size)} metacells.  Groups
-#' with fewer than \code{cell_min} cells are excluded.
+#' Within each combination of \code{group_vars}, cells are assigned to
+#' \code{floor(n / cell_size)} metacells, either randomly or by similarity in
+#' an embedding (see \code{method}).  Groups with fewer than \code{cell_min}
+#' cells are excluded.  With \code{method = "similarity"} the metacell
+#' metadata gains a \code{compactness} column (mean cell-to-centroid distance
+#' in the embedding).
 #'
 #' @param so_obj A Seurat object.
 #' @param group_vars Character vector of metadata column names to group by,
@@ -104,6 +166,23 @@
 #'   \code{Idents} of the returned Seurat object (e.g. \code{"cell_type"} or
 #'   a derived column like \code{"time_treat"}).  \code{NULL} (default) leaves
 #'   Idents unchanged.
+#' @param method \code{"random"} (default): cells are shuffled and dealt
+#'   round-robin into metacells.  \code{"similarity"}: cells that are close in
+#'   the embedding \code{reduction} are grouped together via balanced
+#'   recursive PCA bisection.  Both give identical metacell counts and sizes
+#'   (within one cell); only which cells share a metacell differs.  The
+#'   similarity method is deterministic, so \code{seed} does not affect it.
+#' @param reduction Dimensional reduction used when
+#'   \code{method = "similarity"}, e.g. \code{"pca"}, \code{"harmony"}.
+#' @param n_dims Use only the first \code{n_dims} dimensions of
+#'   \code{reduction}.  \code{NULL} (default) uses all.
+#' @param refine When \code{method = "similarity"}, polish the bisection with
+#'   size-preserving swaps between neighbouring metacells.
+#' @param n_init_pcs When \code{method = "similarity"}, try each split
+#'   starting from PC1 ... PC\code{n_init_pcs} and keep the tightest cut.
+#'   \code{1} (default) starts from PC1 only; \code{3} helps when a broad
+#'   gradient dominates PC1 but distinct sub-states separate along a later
+#'   PC.  Cost grows roughly linearly with \code{n_init_pcs}.
 #'
 #' @return A named list with:
 #'   \describe{
@@ -132,21 +211,28 @@ make_metacells_by_size <- function(
     assays      = "SCT",
     seed        = 42L,
     save_membership = NULL,
-    idents_col  = NULL
+    idents_col  = NULL,
+    method      = c("random", "similarity"),
+    reduction   = "pca",
+    n_dims      = NULL,
+    refine      = TRUE,
+    n_init_pcs  = 1L
 ) {
+  method <- match.arg(method)
+  if (n_init_pcs < 1L) stop("[scagg] n_init_pcs must be >= 1")
   if (is.null(cell_min)) cell_min <- .default_cell_min(cell_size)
   if (is.null(meta_vars)) {
     meta_vars <- setdiff(colnames(so_obj@meta.data), group_vars)
   }
 
+  emb   <- .get_embedding(so_obj, method, reduction, n_dims)
   mdata <- so_obj@meta.data
 
   labels_fn <- function(idx) {
     n <- length(idx)
     if (n < cell_min) return(NULL)
     n_mc    <- if (n < cell_size) 1L else n %/% cell_size
-    labels  <- rep(seq_len(n_mc), length.out = n)
-    labels  <- sample(labels)
+    labels  <- .group_labels(idx, n_mc, emb, refine, n_init_pcs)
     key     <- paste(vapply(group_vars, function(v) as.character(mdata[idx[1], v]),
                             character(1)), collapse = "_")
     paste0("mc", labels, "_", key)
@@ -155,14 +241,17 @@ make_metacells_by_size <- function(
   mdata <- .assign_metacells(mdata, group_vars, labels_fn, seed)
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
+  extra <- if (is.null(emb)) NULL else .compactness_table(mdata, emb, group_vars, seed)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col,
+          extra_meta = extra)
 }
 
 
 #' Aggregate cells into exactly \code{n_metacells} metacells per group
 #'
-#' Within each combination of \code{group_vars}, cells are randomly assigned
-#' to exactly \code{n_metacells} groups.
+#' Within each combination of \code{group_vars}, cells are assigned to
+#' exactly \code{n_metacells} groups, either randomly or by similarity in an
+#' embedding (see \code{method}).
 #'
 #' @param so_obj A Seurat object.
 #' @param group_vars Character vector of metadata column names to group by.
@@ -174,6 +263,7 @@ make_metacells_by_size <- function(
 #' @param save_membership Path for membership CSV.
 #' @param idents_col Metadata column to set as active Idents. \code{NULL}
 #'   (default) leaves Idents unchanged.
+#' @inheritParams make_metacells_by_size
 #'
 #' @return Named list with \code{obj} (Seurat) and \code{membership} (data.frame).
 #'
@@ -195,20 +285,27 @@ make_metacells_by_num <- function(
     assays      = "SCT",
     seed        = 42L,
     save_membership = NULL,
-    idents_col  = NULL
+    idents_col  = NULL,
+    method      = c("random", "similarity"),
+    reduction   = "pca",
+    n_dims      = NULL,
+    refine      = TRUE,
+    n_init_pcs  = 1L
 ) {
+  method <- match.arg(method)
+  if (n_init_pcs < 1L) stop("[scagg] n_init_pcs must be >= 1")
   if (is.null(meta_vars)) {
     meta_vars <- setdiff(colnames(so_obj@meta.data), group_vars)
   }
 
+  emb   <- .get_embedding(so_obj, method, reduction, n_dims)
   mdata <- so_obj@meta.data
 
   labels_fn <- function(idx) {
     n <- length(idx)
     if (n < min_cells) return(NULL)
     actual_n <- min(n_metacells, n)
-    labels   <- rep(seq_len(actual_n), length.out = n)
-    labels   <- sample(labels)
+    labels   <- .group_labels(idx, actual_n, emb, refine, n_init_pcs)
     key      <- paste(vapply(group_vars, function(v) as.character(mdata[idx[1], v]),
                              character(1)), collapse = "_")
     paste0("mc", labels, "_", key)
@@ -217,7 +314,9 @@ make_metacells_by_num <- function(
   mdata <- .assign_metacells(mdata, group_vars, labels_fn, seed)
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
+  extra <- if (is.null(emb)) NULL else .compactness_table(mdata, emb, group_vars, seed)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col,
+          extra_meta = extra)
 }
 
 
@@ -272,8 +371,8 @@ make_pseudobulk <- function(
 # ── Shared finaliser ──────────────────────────────────────────────────────────
 
 .finish <- function(so_obj, group_vars, meta_vars, assays,
-                    save_membership, mdata, idents_col) {
-  mc_so <- .aggregate_and_meta(so_obj, group_vars, meta_vars, assays)
+                    save_membership, mdata, idents_col, extra_meta = NULL) {
+  mc_so <- .aggregate_and_meta(so_obj, group_vars, meta_vars, assays, extra_meta)
 
   # Optionally set active Idents
   if (!is.null(idents_col)) {

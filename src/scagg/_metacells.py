@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 import anndata as ad
 
@@ -25,6 +25,9 @@ from ._aggregate import (
     _membership_table,
     _sum_by_group,
 )
+from ._partition import compactness as _compactness
+
+_METHODS = ("random", "similarity")
 
 
 def make_pseudobulk(
@@ -88,12 +91,18 @@ def make_metacells_by_size(
     layer: str | None = None,
     seed: int = 42,
     save_membership: str | Path | None = None,
+    method: Literal["random", "similarity"] = "random",
+    use_rep: str = "X_pca",
+    n_dims: int | None = None,
+    refine: bool = True,
+    n_init_pcs: int = 1,
 ) -> ad.AnnData:
-    """Randomly aggregate cells into metacells of approximately *cell_size* cells.
+    """Aggregate cells into metacells of approximately *cell_size* cells.
 
-    Within each group (defined by *group_vars*) cells are shuffled and then
-    assigned round-robin to ``floor(n / cell_size)`` metacells.  Groups with
-    fewer than *cell_min* cells are excluded.
+    Within each group (defined by *group_vars*) cells are assigned to
+    ``floor(n / cell_size)`` metacells — randomly, or by similarity in an
+    embedding (see *method*).  Groups with fewer than *cell_min* cells are
+    excluded.
 
     Parameters
     ----------
@@ -115,10 +124,35 @@ def make_metacells_by_size(
         Random seed for reproducibility.
     save_membership:
         Path for the cell → metacell CSV.
+    method:
+        ``"random"`` (default): cells are shuffled and dealt round-robin into
+        metacells.  ``"similarity"``: cells that are close in the embedding
+        *use_rep* are grouped together via balanced recursive PCA bisection.
+        Both methods give identical metacell counts and sizes (within ±1
+        cell); only which cells share a metacell differs.  The similarity
+        method is deterministic, so *seed* has no effect on it.
+    use_rep:
+        ``adata.obsm`` key of the embedding used when
+        ``method="similarity"``, e.g. ``"X_pca"``, ``"X_harmony"``,
+        ``"X_scVI"``.
+    n_dims:
+        Use only the first *n_dims* columns of *use_rep*.  ``None`` = all.
+    refine:
+        When ``method="similarity"``, polish the bisection by size-preserving
+        swaps between neighbouring metacells (never increases
+        within-metacell spread).
+    n_init_pcs:
+        When ``method="similarity"``, try each split starting from PC1 …
+        PC{n_init_pcs} and keep the tightest cut.  ``1`` (default) starts from
+        PC1 only; ``3`` helps when a broad gradient dominates PC1 but
+        distinct sub-states separate along a later PC.  Cost grows roughly
+        linearly with *n_init_pcs*.
 
     Returns
     -------
-    AnnData with one obs per metacell.
+    AnnData with one obs per metacell.  With ``method="similarity"``,
+    ``obs["compactness"]`` holds each metacell's mean cell-to-centroid
+    distance in the embedding.
     """
     if isinstance(group_vars, str):
         group_vars = [group_vars]
@@ -127,9 +161,13 @@ def make_metacells_by_size(
     if cell_min is None:
         cell_min = _default_cell_min(cell_size)
 
+    emb = _get_embedding(adata, method, use_rep, n_dims)
+    if n_init_pcs < 1:
+        raise ValueError(f"n_init_pcs must be >= 1, got {n_init_pcs}")
     rng = np.random.default_rng(seed)
     obs = adata.obs.copy()
-    obs = _assign_by_size(obs, group_vars, cell_size, cell_min, rng, "metacell_id")
+    obs = _assign_by_size(obs, group_vars, cell_size, cell_min, rng, "metacell_id",
+                          emb=emb, refine=refine, n_init_pcs=n_init_pcs)
 
     return _build_result(
         adata=adata,
@@ -138,7 +176,9 @@ def make_metacells_by_size(
         meta_vars=meta_vars,
         layer=layer,
         save_membership=save_membership,
-        strategy=f"by_size_{cell_size}",
+        strategy=_strategy_name(f"by_size_{cell_size}", method),
+        emb=emb,
+        seed=seed,
     )
 
 
@@ -152,8 +192,16 @@ def make_metacells_by_num(
     layer: str | None = None,
     seed: int = 42,
     save_membership: str | Path | None = None,
+    method: Literal["random", "similarity"] = "random",
+    use_rep: str = "X_pca",
+    n_dims: int | None = None,
+    refine: bool = True,
+    n_init_pcs: int = 1,
 ) -> ad.AnnData:
-    """Randomly aggregate cells into exactly *n_metacells* metacells per group.
+    """Aggregate cells into exactly *n_metacells* metacells per group.
+
+    Cells are assigned randomly or by similarity in an embedding (see
+    *method*).
 
     Parameters
     ----------
@@ -174,10 +222,35 @@ def make_metacells_by_num(
         Random seed.
     save_membership:
         Path for the cell → metacell CSV.
+    method:
+        ``"random"`` (default): cells are shuffled and dealt round-robin into
+        metacells.  ``"similarity"``: cells that are close in the embedding
+        *use_rep* are grouped together via balanced recursive PCA bisection.
+        Both methods give identical metacell counts and sizes (within ±1
+        cell); only which cells share a metacell differs.  The similarity
+        method is deterministic, so *seed* has no effect on it.
+    use_rep:
+        ``adata.obsm`` key of the embedding used when
+        ``method="similarity"``, e.g. ``"X_pca"``, ``"X_harmony"``,
+        ``"X_scVI"``.
+    n_dims:
+        Use only the first *n_dims* columns of *use_rep*.  ``None`` = all.
+    refine:
+        When ``method="similarity"``, polish the bisection by size-preserving
+        swaps between neighbouring metacells (never increases
+        within-metacell spread).
+    n_init_pcs:
+        When ``method="similarity"``, try each split starting from PC1 …
+        PC{n_init_pcs} and keep the tightest cut.  ``1`` (default) starts from
+        PC1 only; ``3`` helps when a broad gradient dominates PC1 but
+        distinct sub-states separate along a later PC.  Cost grows roughly
+        linearly with *n_init_pcs*.
 
     Returns
     -------
-    AnnData with one obs per metacell.
+    AnnData with one obs per metacell.  With ``method="similarity"``,
+    ``obs["compactness"]`` holds each metacell's mean cell-to-centroid
+    distance in the embedding.
     """
     if isinstance(group_vars, str):
         group_vars = [group_vars]
@@ -186,9 +259,13 @@ def make_metacells_by_num(
     if min_cells is None:
         min_cells = n_metacells
 
+    emb = _get_embedding(adata, method, use_rep, n_dims)
+    if n_init_pcs < 1:
+        raise ValueError(f"n_init_pcs must be >= 1, got {n_init_pcs}")
     rng = np.random.default_rng(seed)
     obs = adata.obs.copy()
-    obs = _assign_by_num(obs, group_vars, n_metacells, min_cells, rng, "metacell_id")
+    obs = _assign_by_num(obs, group_vars, n_metacells, min_cells, rng, "metacell_id",
+                         emb=emb, refine=refine, n_init_pcs=n_init_pcs)
 
     return _build_result(
         adata=adata,
@@ -197,8 +274,76 @@ def make_metacells_by_num(
         meta_vars=meta_vars,
         layer=layer,
         save_membership=save_membership,
-        strategy=f"by_num_{n_metacells}",
+        strategy=_strategy_name(f"by_num_{n_metacells}", method),
+        emb=emb,
+        seed=seed,
     )
+
+
+# ── Internal helpers ─────────────────────────────────────────────────────────
+
+def _strategy_name(base: str, method: str) -> str:
+    return base if method == "random" else f"{base}_{method}"
+
+
+def _get_embedding(
+    adata: ad.AnnData,
+    method: str,
+    use_rep: str,
+    n_dims: int | None,
+) -> np.ndarray | None:
+    """Validate *method* and return the embedding matrix (``None`` for random)."""
+    if method not in _METHODS:
+        raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
+    if method == "random":
+        return None
+    if use_rep not in adata.obsm:
+        available = ", ".join(adata.obsm.keys()) or "none"
+        raise KeyError(
+            f"use_rep={use_rep!r} not found in adata.obsm (available: {available}). "
+            "Compute one first, e.g. sc.pp.pca(adata)."
+        )
+    if not adata.obs_names.is_unique:
+        raise ValueError("method='similarity' requires unique obs_names "
+                         "(see adata.obs_names_make_unique()).")
+    emb = np.asarray(adata.obsm[use_rep], dtype=np.float64)
+    if n_dims is not None:
+        if n_dims < 1:
+            raise ValueError(f"n_dims must be >= 1, got {n_dims}")
+        emb = emb[:, :n_dims]
+    if not np.isfinite(emb).all():
+        raise ValueError(f"adata.obsm[{use_rep!r}] contains NaN or infinite values.")
+    return emb
+
+
+def _add_compactness(
+    adata: ad.AnnData,
+    assigned: pd.DataFrame,
+    mc_meta: pd.DataFrame,
+    group_vars: list[str],
+    emb: np.ndarray,
+    seed: int,
+) -> pd.DataFrame:
+    """Add per-metacell compactness and log it against a size-matched random baseline."""
+    pos = adata.obs_names.get_indexer(assigned.index)
+    sub_emb = emb[pos]
+    mc_ids = assigned["metacell_id"].to_numpy()
+    mc_meta = mc_meta.copy()
+    mc_meta["compactness"] = pd.Series(_compactness(sub_emb, mc_ids))
+
+    # Baseline: shuffle metacell labels within each stratum (same sizes).
+    rng = np.random.default_rng(seed)
+    shuffled = mc_ids.copy()
+    for _, rows in assigned.groupby(group_vars, sort=False).indices.items():
+        shuffled[rows] = rng.permutation(mc_ids[rows])
+    baseline = np.median(list(_compactness(sub_emb, shuffled).values()))
+    observed = float(np.median(mc_meta["compactness"]))
+    print(
+        f"[scagg] median metacell compactness: {observed:.3g} "
+        f"(random metacells of the same sizes: {baseline:.3g})",
+        flush=True,
+    )
+    return mc_meta
 
 
 # ── Internal builder ─────────────────────────────────────────────────────────
@@ -211,6 +356,8 @@ def _build_result(
     layer: str | None,
     save_membership: str | Path | None,
     strategy: str,
+    emb: np.ndarray | None = None,
+    seed: int = 42,
 ) -> ad.AnnData:
     assigned = obs_with_mc[obs_with_mc["metacell_id"] != "unassigned"]
     n_unassigned = len(obs_with_mc) - len(assigned)
@@ -243,6 +390,8 @@ def _build_result(
 
     mc_meta = _aggregate_metadata(assigned, "metacell_id", meta_vars_list, group_vars)
     mc_meta = mc_meta.loc[unique_ids]   # ensure same order as agg_X rows
+    if emb is not None:
+        mc_meta = _add_compactness(adata, assigned, mc_meta, group_vars, emb, seed)
 
     new_adata = ad.AnnData(
         X=agg_X,
