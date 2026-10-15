@@ -13,6 +13,8 @@ except ImportError:
     def issparse(x):  # type: ignore[misc]
         return False
 
+from ._partition import balanced_partition
+
 
 # ── Cell-to-metacell assignment ───────────────────────────────────────────────
 
@@ -23,6 +25,9 @@ def _assign_by_size(
     cell_min: int,
     rng: np.random.Generator,
     metacell_col: str,
+    emb: np.ndarray | None = None,
+    refine: bool = True,
+    n_init_pcs: int = 1,
 ) -> pd.DataFrame:
     obs = obs.copy()
     obs[metacell_col] = "unassigned"
@@ -32,8 +37,7 @@ def _assign_by_size(
         if n < cell_min:
             continue
         n_mc = 1 if n < cell_size else n // cell_size
-        labels = np.tile(np.arange(1, n_mc + 1), -(-n // n_mc))[:n]
-        labels = rng.permutation(labels)
+        labels = _group_labels(obs, grp, n_mc, rng, emb, refine, n_init_pcs)
         key_str = _key_str(keys)
         obs.loc[grp.index, metacell_col] = [f"mc{l}_{key_str}" for l in labels]
 
@@ -47,6 +51,9 @@ def _assign_by_num(
     min_cells: int,
     rng: np.random.Generator,
     metacell_col: str,
+    emb: np.ndarray | None = None,
+    refine: bool = True,
+    n_init_pcs: int = 1,
 ) -> pd.DataFrame:
     obs = obs.copy()
     obs[metacell_col] = "unassigned"
@@ -56,12 +63,25 @@ def _assign_by_num(
         if n < min_cells:
             continue
         actual_n = min(n_metacells, n)
-        labels = np.tile(np.arange(1, actual_n + 1), -(-n // actual_n))[:n]
-        labels = rng.permutation(labels)
+        labels = _group_labels(obs, grp, actual_n, rng, emb, refine, n_init_pcs)
         key_str = _key_str(keys)
         obs.loc[grp.index, metacell_col] = [f"mc{l}_{key_str}" for l in labels]
 
     return obs
+
+
+def _group_labels(obs, grp, n_mc, rng, emb, refine, n_init_pcs) -> np.ndarray:
+    """Metacell labels 1..n_mc for the cells of one group.
+
+    ``emb is None`` → random balanced assignment; otherwise similarity-based
+    balanced partition of the group's rows of *emb*.
+    """
+    n = len(grp)
+    if emb is None:
+        labels = np.tile(np.arange(1, n_mc + 1), -(-n // n_mc))[:n]
+        return rng.permutation(labels)
+    pos = obs.index.get_indexer(grp.index)
+    return balanced_partition(emb[pos], n_mc, refine=refine, n_init_pcs=n_init_pcs) + 1
 
 
 def _assign_pseudobulk(

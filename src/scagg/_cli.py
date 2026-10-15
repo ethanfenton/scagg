@@ -40,6 +40,20 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Path to save cell → metacell membership CSV"),
     )
 
+    def _add_method(sp):
+        sp.add_argument("--method", choices=["random", "similarity"], default="random",
+                        help="How cells are grouped within each stratum: randomly, or "
+                             "by similarity in an embedding [default: random]")
+        sp.add_argument("--use-rep", default="X_pca", metavar="KEY",
+                        help="obsm embedding for --method similarity [default: X_pca]")
+        sp.add_argument("--n-dims", type=int, default=None, metavar="N",
+                        help="Use the first N embedding dimensions (default: all)")
+        sp.add_argument("--no-refine", action="store_true",
+                        help="Skip size-preserving refinement for --method similarity")
+        sp.add_argument("--n-init-pcs", type=int, default=1, metavar="N",
+                        help="For --method similarity, try each split from PC1..PCN "
+                             "and keep the tightest [default: 1]")
+
     # pseudobulk
     sp_pb = sub.add_parser("pseudobulk", help="True pseudobulk aggregation")
     _add_common(sp_pb)
@@ -55,6 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
                             "(default: 70%% of --cell-size)")
     sp_sz.add_argument("--seed", type=int, default=42, metavar="N",
                        help="Random seed [default: 42]")
+    _add_method(sp_sz)
 
     # metacells-by-num
     sp_num = sub.add_parser("metacells-by-num",
@@ -66,6 +81,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Minimum cells needed (default: --n-metacells)")
     sp_num.add_argument("--seed", type=int, default=42, metavar="N",
                         help="Random seed [default: 42]")
+    _add_method(sp_num)
 
     return p
 
@@ -99,16 +115,21 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "pseudobulk":
         result = make_pseudobulk(adata, **kwargs)
-    elif args.command == "metacells-by-size":
-        result = make_metacells_by_size(
-            adata, cell_size=args.cell_size, cell_min=args.cell_min,
-            seed=args.seed, **kwargs,
+    else:
+        mc_kwargs = dict(
+            seed=args.seed, method=args.method, use_rep=args.use_rep,
+            n_dims=args.n_dims, refine=not args.no_refine,
+            n_init_pcs=args.n_init_pcs, **kwargs,
         )
-    elif args.command == "metacells-by-num":
-        result = make_metacells_by_num(
-            adata, n_metacells=args.n_metacells, min_cells=args.min_cells,
-            seed=args.seed, **kwargs,
-        )
+        if args.command == "metacells-by-size":
+            result = make_metacells_by_size(
+                adata, cell_size=args.cell_size, cell_min=args.cell_min, **mc_kwargs,
+            )
+        else:
+            result = make_metacells_by_num(
+                adata, n_metacells=args.n_metacells, min_cells=args.min_cells,
+                **mc_kwargs,
+            )
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -5,4 +5,5 @@ export(make_metacells_by_num)
 export(make_pseudobulk)
 
 importFrom(dplyr, left_join)
+importFrom(stats, dist, median, setNames)
 importFrom(utils, write.csv)
