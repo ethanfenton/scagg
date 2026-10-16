@@ -97,17 +97,24 @@ def _assign_pseudobulk(
 # ── Expression aggregation ────────────────────────────────────────────────────
 
 def _sum_by_group(X, group_labels: np.ndarray):
-    """Return (groups, matrix) where matrix[i] = sum over group i."""
-    unique_groups = pd.unique(group_labels)  # preserves order
-    rows = []
-    for g in unique_groups:
-        mask = group_labels == g
-        block = X[mask]
-        if issparse(block):
-            rows.append(np.asarray(block.sum(axis=0)).flatten())
-        else:
-            rows.append(np.asarray(block).sum(axis=0))
-    return unique_groups, np.vstack(rows)
+    """Return (groups, matrix) where matrix[i] = sum over the rows of group i.
+
+    Rows labelled ``None`` are skipped.  The sum is one sparse indicator
+    product, so time and memory scale with the input, not groups × cells.
+    """
+    from scipy.sparse import csr_matrix
+
+    group_labels = np.asarray(group_labels, dtype=object)
+    keep = np.flatnonzero(pd.notna(group_labels))
+    codes, order = pd.factorize(group_labels[keep])   # first-appearance order
+    dtype = X.dtype if np.issubdtype(X.dtype, np.floating) else np.int64
+    ind = csr_matrix(
+        (np.ones(len(keep), dtype=dtype), (codes, keep)),
+        shape=(len(order), X.shape[0]),
+    )
+    out = ind @ X
+    out = out.toarray() if issparse(out) else np.asarray(out)
+    return order, out
 
 
 # ── Metadata aggregation ──────────────────────────────────────────────────────
@@ -142,6 +149,32 @@ def _membership_table(obs: pd.DataFrame, metacell_col: str) -> pd.DataFrame:
     t = obs[cols].copy()
     t.index.name = "cell_barcode"
     return t
+
+
+# ── Safety check ─────────────────────────────────────────────────────────────
+
+def _check_metacell_purity(obs: pd.DataFrame, group_vars: Sequence[str],
+                           metacell_col: str = "metacell_id") -> None:
+    """Raise unless every metacell holds cells from one *group_vars* combination.
+
+    Different groups can map to the same ID when values contain ``"_"``
+    (``("A_1", "x")`` and ``("A", "1_x")`` both give ``"A_1_x"``), which would
+    otherwise sum cells from different samples together.
+    """
+    assigned = obs[obs[metacell_col] != "unassigned"]
+    if assigned.empty:
+        return
+    n_groups = (assigned[list(group_vars)].astype(str)
+                .groupby(assigned[metacell_col].to_numpy())
+                .nunique().max(axis=1))
+    bad = n_groups.index[n_groups > 1]
+    if len(bad) > 0:
+        raise ValueError(
+            f"{len(bad)} metacell ID(s) would combine cells from different "
+            f"{' × '.join(group_vars)} groups (e.g. {bad[0]!r}), because group "
+            f"values joined with '_' collide. Rename the values in "
+            f"{list(group_vars)} so that no joined combination is ambiguous."
+        )
 
 
 # ── Utility ──────────────────────────────────────────────────────────────────

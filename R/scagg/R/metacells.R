@@ -20,6 +20,7 @@
     result <- labels_fn(idx)
     if (!is.null(result)) mdata$metacell_id[idx] <- result
   }
+  .check_metacell_purity(mdata, group_vars)
   mdata
 }
 
@@ -67,74 +68,316 @@
              stringsAsFactors = FALSE)
 }
 
-# Aggregate a Seurat object and attach clean metadata.
-.aggregate_and_meta <- function(so_obj, group_vars, meta_vars, assays,
-                                extra_meta = NULL) {
-  mdata <- so_obj@meta.data
-
-  # Filter out unassigned cells
+# Stop unless every metacell holds cells from a single combination of
+# `group_vars` (e.g. one sample × one cell type).  Different groups can map to
+# the same ID when values contain "_" (("A_1", "x") and ("A", "1_x") both give
+# "A_1_x"), which would otherwise sum cells from different samples together.
+.check_metacell_purity <- function(mdata, group_vars) {
   keep <- mdata$metacell_id != "unassigned"
-  so_sub <- subset(so_obj, cells = rownames(mdata)[keep])
+  if (!any(keep)) return(invisible(NULL))
+  key <- do.call(paste, c(lapply(mdata[keep, group_vars, drop = FALSE], as.character),
+                          sep = "\r"))
+  pairs <- unique(data.frame(id = mdata$metacell_id[keep], key = key,
+                             stringsAsFactors = FALSE))
+  bad <- unique(pairs$id[duplicated(pairs$id)])
+  if (length(bad) > 0L) {
+    stop(sprintf(paste0(
+      "[scagg] %d metacell ID(s) would combine cells from different %s groups ",
+      "(e.g. '%s'), because group values joined with '_' collide. Rename the ",
+      "values in %s so that no joined combination is ambiguous."),
+      length(bad), paste(group_vars, collapse = " × "), bad[1],
+      paste(group_vars, collapse = ", ")))
+  }
+  invisible(NULL)
+}
 
-  # Aggregate expression
-  mc_so <- Seurat::AggregateExpression(
-    so_sub,
-    group.by  = "metacell_id",
-    assays    = assays,
-    return.seurat = TRUE
-  )
+.check_value_args <- function(from_log, mean_normalized) {
+  if (isTRUE(mean_normalized) && !isTRUE(from_log)) {
+    stop("[scagg] mean_normalized = TRUE requires from_log = TRUE (it averages ",
+         "log-normalised values in linear space).")
+  }
+}
 
-  # Build per-metacell metadata from the original object
-  cols_to_keep <- unique(c("metacell_id", group_vars, meta_vars))
-  cols_present <- intersect(cols_to_keep, colnames(mdata))
+# Every layer of an assay named `layer` (Seurat v5 splits it into one per
+# batch: counts.s1, counts.s2, ...), as a list of features × cells matrices.
+.assay_layers <- function(assay_obj, assay, layer) {
+  mats <- if (inherits(assay_obj, "Assay5")) {
+    lapply(SeuratObject::Layers(assay_obj, search = layer),
+           function(l) SeuratObject::LayerData(assay_obj, layer = l))
+  } else {
+    list(methods::slot(assay_obj, layer))
+  }
+  mats <- Filter(function(m) prod(dim(m)) > 0, mats)
+  if (length(mats) == 0L) stop(sprintf("[scagg] assay '%s' has no '%s' layer", assay, layer))
+  mats
+}
 
-  mc_mdata <- mdata[keep, cols_present, drop = FALSE]
+# expm1 of a matrix, as a dgCMatrix.
+.expm1_sparse <- function(m) {
+  m <- methods::as(methods::as(m, "CsparseMatrix"), "dMatrix")
+  m@x <- expm1(m@x)
+  m
+}
 
-  # For each metacell take the most common value of each column
-  mc_mdata_agg <- do.call(rbind, lapply(
-    split(mc_mdata, mc_mdata$metacell_id),
-    function(df) {
-      row <- as.data.frame(lapply(df, function(x) {
-        if (is.numeric(x)) mean(x, na.rm = TRUE)
-        else {
-          tab <- sort(table(x), decreasing = TRUE)
-          if (length(tab) == 0L) NA else names(tab)[1L]
-        }
-      }), stringsAsFactors = FALSE)
-      row$n_cells <- nrow(df)
-      row
+# Smallest positive value in each column of a dgCMatrix (NA if none).
+.col_min_positive <- function(m) {
+  col <- rep.int(seq_len(ncol(m)), diff(m@p))
+  pos <- m@x > 0
+  mins <- tapply(m@x[pos], factor(col[pos], levels = seq_len(ncol(m))), min)
+  as.vector(mins)
+}
+
+# Per-column value of a single count in linear-space data (dgCMatrix, genes
+# × cells).  Every non-zero value is a whole multiple of it, so the unit is
+# min / c for the smallest c in 1..max_multiple that makes all of the cell's
+# values whole multiples.  c = 1 is the plain smallest-non-zero trick; larger
+# c handles cells with no count of exactly 1.  NA for cells without counts.
+.count_unit <- function(m, max_multiple = 10L, tol = 0.05) {
+  min_pos <- .col_min_positive(m)
+  unit <- min_pos
+  todo <- is.finite(min_pos)
+  col  <- rep.int(seq_len(ncol(m)), diff(m@p))
+  colf <- factor(col, levels = seq_len(ncol(m)))
+  for (c in seq_len(max_multiple)) {
+    if (!any(todo)) break
+    u     <- min_pos / c
+    ratio <- m@x / u[col]
+    dev   <- ifelse(todo[col], abs(ratio - round(ratio)), 0)
+    worst <- as.vector(tapply(dev, colf, max))
+    ok    <- todo & !is.na(worst) & worst < tol
+    unit[ok] <- u[ok]
+    todo <- todo & !ok
+  }
+  unit
+}
+
+# Raw counts from log-normalised layers, x = log1p(count / total * sf):
+# count = expm1(x) * total / sf.  Without totals, each cell's smallest
+# non-zero value is taken as a count of 1.  `scale_factor = NULL` infers sf.
+.recover_counts <- function(mats, totals, scale_factor) {
+  lin  <- lapply(mats, .expm1_sparse)
+  mins <- lapply(lin, .count_unit)        # value of one count in each cell
+
+  if (is.null(totals)) {
+    message("[scagg] from_log: no per-cell totals found; falling back to the ",
+            "smallest-non-zero trick (each cell's values are scaled so its ",
+            "smallest non-zero value is the smallest whole count consistent ",
+            "with the rest, usually 1). Set total_col to use stored totals.")
+    sizes <- mins
+  } else {
+    tot <- lapply(lin, function(m) unname(totals[colnames(m)]))
+    if (is.null(scale_factor)) {
+      est <- unlist(Map(`*`, mins, tot))
+      est <- est[is.finite(est) & est > 0]
+      if (length(est) == 0L) {
+        stop("[scagg] cannot infer scale_factor: no cell has both a valid total ",
+             "and a non-zero value")
+      }
+      scale_factor <- stats::median(est)
+      message(sprintf("[scagg] from_log: inferred scale_factor = %.6g", scale_factor))
     }
-  ))
+    n_bad <- 0L
+    sizes <- Map(function(t, mn) {
+      ok <- is.finite(t) & t > 0
+      n_bad <<- n_bad + sum(!ok)
+      ifelse(ok, scale_factor / t, mn)
+    }, tot, mins)
+    if (n_bad > 0L) {
+      message(sprintf(paste0(
+        "[scagg] from_log: %d cell(s) have a missing or zero total; falling back ",
+        "to the smallest-non-zero trick for them."), n_bad))
+    }
+  }
 
-  # Join to AggregateExpression metadata
-  mc_mdata_agg$metacell_id <- rownames(mc_mdata_agg)
+  dev <- 0
+  out <- Map(function(m, size) {
+    size[!is.finite(size) | size <= 0] <- 1          # cells with no counts
+    col <- rep.int(seq_len(ncol(m)), diff(m@p))
+    m@x <- m@x / size[col]
+    if (length(m@x)) dev <<- max(dev, abs(m@x - round(m@x)))
+    m@x <- round(m@x)
+    m
+  }, lin, sizes)
+  if (dev > 0.1) {
+    warning(sprintf(paste0(
+      "[scagg] recovered counts are up to %.3g away from whole numbers, so the ",
+      "input may not be log1p(count / total * scale_factor) (e.g. it was scaled ",
+      "or used a different total). Check total_col and scale_factor."), dev))
+  }
+  out
+}
+
+# Sum each matrix's columns per metacell: features × metacells dgCMatrix.
+# Each matrix is multiplied by a sparse cells × metacells indicator, so
+# memory scales with the non-zeros, not with features × cells.
+.sum_by_group <- function(mats, groups) {
+  total <- NULL
+  for (m in mats) {
+    g <- groups[colnames(m)]
+    rows <- which(!is.na(g))
+    ind <- Matrix::sparseMatrix(
+      i = rows, j = as.integer(g[rows]), x = 1,
+      dims = c(ncol(m), nlevels(groups)))
+    part <- methods::as(m %*% ind, "CsparseMatrix")
+    rownames(part) <- rownames(m)
+    if (is.null(total)) {
+      total <- part
+    } else {
+      if (!identical(rownames(part), rownames(total))) {
+        stop("[scagg] layers of one assay have different features")
+      }
+      total <- total + part
+    }
+  }
+  colnames(total) <- levels(groups)
+  total
+}
+
+# Aggregate one assay.  Returns list(values, kind): kind "counts" (summed
+# counts, or recovered counts with from_log) or "mean_normalized"
+# (log1p of the mean of expm1(data)).
+.aggregate_assay <- function(so_obj, assay, groups, from_log, mean_normalized,
+                             total_col, scale_factor) {
+  assay_obj <- so_obj[[assay]]
+  if (!from_log) {
+    return(list(values = .sum_by_group(.assay_layers(assay_obj, assay, "counts"), groups),
+                kind = "counts"))
+  }
+  if (inherits(assay_obj, "SCTAssay")) {
+    stop("[scagg] from_log = TRUE is not needed for SCT assays: their 'counts' ",
+         "layer already holds the corrected counts. Use from_log = FALSE.")
+  }
+  mats <- .assay_layers(assay_obj, assay, "data")
+
+  if (mean_normalized) {
+    sums  <- .sum_by_group(lapply(mats, .expm1_sparse), groups)
+    sizes <- as.vector(table(groups))
+    sums@x <- log1p(sums@x / sizes[rep.int(seq_len(ncol(sums)), diff(sums@p))])
+    return(list(values = sums, kind = "mean_normalized"))
+  }
+
+  md <- so_obj@meta.data
+  if (is.null(total_col)) {
+    total_col <- paste0("nCount_", assay)
+    totals <- if (total_col %in% colnames(md)) md[[total_col]] else NULL
+    if (!is.null(totals)) message("[scagg] from_log: using per-cell totals from '",
+                                  total_col, "'")
+  } else {
+    if (!total_col %in% colnames(md)) {
+      stop(sprintf("[scagg] total_col '%s' not found in metadata", total_col))
+    }
+    totals <- md[[total_col]]
+  }
+  if (!is.null(totals)) {
+    totals <- stats::setNames(suppressWarnings(as.numeric(totals)), rownames(md))
+  }
+  list(values = .sum_by_group(.recover_counts(mats, totals, scale_factor), groups),
+       kind = "counts")
+}
+
+# Per-metacell metadata: mean for numeric columns, most common value otherwise
+# (ties go to the first value in sort order).
+.metacell_meta <- function(mdata, cols, groups) {
+  out <- data.frame(row.names = levels(groups))
+  for (col in cols) {
+    x <- mdata[[col]]
+    if (is.numeric(x)) {
+      ok <- !is.na(x)
+      out[[col]] <- as.vector(
+        rowsum(ifelse(ok, x, 0), groups, reorder = TRUE) /
+          rowsum(as.numeric(ok), groups, reorder = TRUE))
+    } else {
+      x  <- as.character(x)
+      ok <- !is.na(x)
+      gi <- as.integer(groups)[ok]
+      xv <- x[ok]
+      o  <- order(gi, xv)
+      gi <- gi[o]; xv <- xv[o]
+      n  <- length(gi)
+      starts <- if (n == 0L) logical(0) else
+        c(TRUE, gi[-1L] != gi[-n] | xv[-1L] != xv[-n])
+      run_len <- tabulate(cumsum(starts))
+      run_g   <- gi[starts]
+      run_x   <- xv[starts]
+      best    <- order(run_g, -run_len)
+      first   <- best[!duplicated(run_g[best])]
+      vals    <- rep(NA_character_, nlevels(groups))
+      vals[run_g[first]] <- run_x[first]
+      out[[col]] <- vals
+    }
+  }
+  out$n_cells <- as.vector(table(groups))
+  out
+}
+
+# Build the aggregated Seurat object: summed counts for each assay, plus
+# per-metacell metadata.  Counts are summed directly rather than through
+# Seurat::AggregateExpression(return.seurat = TRUE), which also copies the
+# object with subset() and runs ScaleData() on every gene; that needs more than
+# 32 GB on large objects.  With `normalize = TRUE` each assay is
+# log-normalised (sparse and cheap); nothing is scaled.  With `from_log` the
+# `data` layer is used instead of `counts` (see .aggregate_assay).
+.aggregate_and_meta <- function(so_obj, group_vars, meta_vars, assays,
+                                extra_meta = NULL, normalize = TRUE,
+                                from_log = FALSE, mean_normalized = FALSE,
+                                total_col = NULL, scale_factor = NULL) {
+  mdata <- so_obj@meta.data
+  keep  <- mdata$metacell_id != "unassigned"
+  if (!any(keep)) stop("[scagg] all cells were excluded; no metacells formed")
+
+  ids    <- mdata$metacell_id[keep]
+  groups <- factor(ids, levels = unique(ids))
+  cell_groups <- stats::setNames(factor(rep(NA_character_, nrow(mdata)),
+                                        levels = levels(groups)),
+                                 rownames(mdata))
+  cell_groups[keep] <- groups
+
+  missing <- setdiff(assays, SeuratObject::Assays(so_obj))
+  if (length(missing) > 0L) {
+    stop(sprintf("[scagg] assay(s) not found: %s (available: %s)",
+                 paste(missing, collapse = ", "),
+                 paste(SeuratObject::Assays(so_obj), collapse = ", ")))
+  }
+
+  cols <- setdiff(intersect(unique(c(group_vars, meta_vars)), colnames(mdata)),
+                  "metacell_id")
+  mc_meta <- .metacell_meta(mdata[keep, , drop = FALSE], cols, groups)
+  mc_meta <- cbind(data.frame(metacell_id = levels(groups),
+                              row.names = levels(groups),
+                              stringsAsFactors = FALSE),
+                   mc_meta)
   if (!is.null(extra_meta)) {
-    mc_mdata_agg <- dplyr::left_join(mc_mdata_agg, extra_meta, by = "metacell_id")
+    mc_meta <- dplyr::left_join(mc_meta, extra_meta, by = "metacell_id")
+    rownames(mc_meta) <- mc_meta$metacell_id
   }
 
-  # Seurat v5's AggregateExpression replaces "_" with "-" in group names, so
-  # map its column names back to the original metacell IDs before joining.
-  agg_names <- rownames(mc_so@meta.data)
-  orig_ids  <- mc_mdata_agg$metacell_id
-  id_map    <- c(stats::setNames(orig_ids, orig_ids),
-                 stats::setNames(orig_ids, gsub("_", "-", orig_ids, fixed = TRUE)))
-  id_map    <- id_map[!duplicated(names(id_map))]
-  mc_so@meta.data$metacell_id <- unname(id_map[agg_names])
-  if (anyNA(mc_so@meta.data$metacell_id)) {
-    warning("[scagg] some aggregated metacells could not be matched to their ",
-            "metadata; their metadata columns will be NA.")
+  mc_so <- NULL
+  for (assay in assays) {
+    agg <- .aggregate_assay(so_obj, assay, cell_groups, from_log, mean_normalized,
+                            total_col, scale_factor)
+    first <- is.null(mc_so)
+    v5 <- first || inherits(mc_so[[assays[1L]]], "Assay5")
+    new_assay <- suppressWarnings(if (agg$kind == "mean_normalized") {
+      if (v5) SeuratObject::CreateAssay5Object(data = agg$values)
+      else SeuratObject::CreateAssayObject(data = agg$values)
+    } else {
+      if (v5) SeuratObject::CreateAssay5Object(counts = agg$values)
+      else SeuratObject::CreateAssayObject(counts = agg$values)
+    })
+    if (first) {
+      mc_so <- SeuratObject::CreateSeuratObject(new_assay, assay = assay)
+    } else {
+      mc_so[[assay]] <- new_assay
+    }
+    if (normalize && agg$kind == "counts") {
+      mc_so <- Seurat::NormalizeData(mc_so, assay = assay, verbose = FALSE)
+    }
   }
 
-  # Merge (left_join keeps row order, so the Seurat cell names stay valid)
-  merged <- dplyr::left_join(
-    mc_so@meta.data,
-    mc_mdata_agg,
-    by = "metacell_id",
-    suffix = c("", ".scagg")
-  )
-  rownames(merged) <- agg_names
-  mc_so@meta.data  <- merged
-
+  # Keep Seurat's own columns (orig.ident, nCount_*, nFeature_*) and add ours.
+  own <- mc_so@meta.data[, setdiff(colnames(mc_so@meta.data), colnames(mc_meta)),
+                         drop = FALSE]
+  mc_so@meta.data <- cbind(own, mc_meta[colnames(mc_so), , drop = FALSE])
   mc_so
 }
 
@@ -183,6 +426,29 @@
 #'   \code{1} (default) starts from PC1 only; \code{3} helps when a broad
 #'   gradient dominates PC1 but distinct sub-states separate along a later
 #'   PC.  Cost grows roughly linearly with \code{n_init_pcs}.
+#' @param normalize If \code{TRUE} (default), log-normalise each assay of the
+#'   result with \code{Seurat::NormalizeData()}.  Counts are always the raw
+#'   sums; no gene is scaled (run \code{ScaleData()} on the genes you need).
+#' @param from_log If \code{TRUE}, aggregate the log-normalised \code{data}
+#'   layer instead of \code{counts}: values \code{log1p(count / total *
+#'   scale_factor)} are converted back to raw counts with
+#'   \code{count = expm1(x) * total / scale_factor} before summing, using each
+#'   cell's total from \code{total_col}.  If no totals are found, each
+#'   cell's smallest non-zero value is taken as a count of 1 (a message says
+#'   so).  Not needed for SCT assays.  Default \code{FALSE}.
+#' @param mean_normalized Only with \code{from_log = TRUE}.  Instead of
+#'   recovering counts, store \code{log1p(mean(expm1(x)))} per metacell in the
+#'   \code{data} layer (no \code{counts} layer): the average normalised
+#'   profile, with every cell weighted equally.  Not for DESeq2 / edgeR.
+#' @param total_col Metadata column with each cell's total count.
+#'   \code{NULL} (default) uses \code{nCount_<assay>} if present.
+#' @param scale_factor Target sum used in normalisation (Seurat default 1e4).
+#'   \code{NULL} (default) infers it from the data.
+#'
+#' @details Cells are only ever pooled with cells that share every value of
+#'   \code{group_vars}: put your sample column in \code{group_vars} (e.g.
+#'   \code{c("cell_type", "sample")}) so that no metacell mixes samples.  The
+#'   function stops if two groups would map to the same metacell ID.
 #'
 #' @return A named list with:
 #'   \describe{
@@ -216,8 +482,14 @@ make_metacells_by_size <- function(
     reduction   = "pca",
     n_dims      = NULL,
     refine      = TRUE,
-    n_init_pcs  = 1L
+    n_init_pcs  = 1L,
+    normalize   = TRUE,
+    from_log    = FALSE,
+    mean_normalized = FALSE,
+    total_col   = NULL,
+    scale_factor = NULL
 ) {
+  .check_value_args(from_log, mean_normalized)
   method <- match.arg(method)
   if (n_init_pcs < 1L) stop("[scagg] n_init_pcs must be >= 1")
   if (is.null(cell_min)) cell_min <- .default_cell_min(cell_size)
@@ -243,7 +515,9 @@ make_metacells_by_size <- function(
 
   extra <- if (is.null(emb)) NULL else .compactness_table(mdata, emb, group_vars, seed)
   .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col,
-          extra_meta = extra)
+          extra_meta = extra, normalize = normalize,
+          values = list(from_log = from_log, mean_normalized = mean_normalized,
+                        total_col = total_col, scale_factor = scale_factor))
 }
 
 
@@ -264,6 +538,7 @@ make_metacells_by_size <- function(
 #' @param idents_col Metadata column to set as active Idents. \code{NULL}
 #'   (default) leaves Idents unchanged.
 #' @inheritParams make_metacells_by_size
+#' @inherit make_metacells_by_size details
 #'
 #' @return Named list with \code{obj} (Seurat) and \code{membership} (data.frame).
 #'
@@ -290,8 +565,14 @@ make_metacells_by_num <- function(
     reduction   = "pca",
     n_dims      = NULL,
     refine      = TRUE,
-    n_init_pcs  = 1L
+    n_init_pcs  = 1L,
+    normalize   = TRUE,
+    from_log    = FALSE,
+    mean_normalized = FALSE,
+    total_col   = NULL,
+    scale_factor = NULL
 ) {
+  .check_value_args(from_log, mean_normalized)
   method <- match.arg(method)
   if (n_init_pcs < 1L) stop("[scagg] n_init_pcs must be >= 1")
   if (is.null(meta_vars)) {
@@ -316,7 +597,9 @@ make_metacells_by_num <- function(
 
   extra <- if (is.null(emb)) NULL else .compactness_table(mdata, emb, group_vars, seed)
   .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col,
-          extra_meta = extra)
+          extra_meta = extra, normalize = normalize,
+          values = list(from_log = from_log, mean_normalized = mean_normalized,
+                        total_col = total_col, scale_factor = scale_factor))
 }
 
 
@@ -333,6 +616,7 @@ make_metacells_by_num <- function(
 #' @param save_membership Path for membership CSV.
 #' @param idents_col Metadata column to set as active Idents. \code{NULL}
 #'   (default) leaves Idents unchanged.
+#' @inheritParams make_metacells_by_size
 #'
 #' @return Named list with \code{obj} and \code{membership}.
 #'
@@ -351,8 +635,14 @@ make_pseudobulk <- function(
     meta_vars   = NULL,
     assays      = "SCT",
     save_membership = NULL,
-    idents_col  = NULL
+    idents_col  = NULL,
+    normalize   = TRUE,
+    from_log    = FALSE,
+    mean_normalized = FALSE,
+    total_col   = NULL,
+    scale_factor = NULL
 ) {
+  .check_value_args(from_log, mean_normalized)
   if (is.null(meta_vars)) {
     meta_vars <- setdiff(colnames(so_obj@meta.data), group_vars)
   }
@@ -362,17 +652,27 @@ make_pseudobulk <- function(
     mdata[, group_vars, drop = FALSE], 1,
     function(r) paste(r, collapse = "_")
   )
+  .check_metacell_purity(mdata, group_vars)
   so_obj@meta.data <- mdata
 
-  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col)
+  .finish(so_obj, group_vars, meta_vars, assays, save_membership, mdata, idents_col,
+          normalize = normalize,
+          values = list(from_log = from_log, mean_normalized = mean_normalized,
+                        total_col = total_col, scale_factor = scale_factor))
 }
 
 
 # ── Shared finaliser ──────────────────────────────────────────────────────────
 
 .finish <- function(so_obj, group_vars, meta_vars, assays,
-                    save_membership, mdata, idents_col, extra_meta = NULL) {
-  mc_so <- .aggregate_and_meta(so_obj, group_vars, meta_vars, assays, extra_meta)
+                    save_membership, mdata, idents_col, extra_meta = NULL,
+                    normalize = TRUE, values = list()) {
+  mc_so <- .aggregate_and_meta(
+    so_obj, group_vars, meta_vars, assays, extra_meta, normalize,
+    from_log        = isTRUE(values$from_log),
+    mean_normalized = isTRUE(values$mean_normalized),
+    total_col       = values$total_col,
+    scale_factor    = values$scale_factor)
 
   # Optionally set active Idents
   if (!is.null(idents_col)) {

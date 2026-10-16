@@ -137,6 +137,9 @@ head(res$membership)                       # which cell went into which metacell
 
 In real data, add your sample column to `group_vars`
 (e.g. `c("cell_type", "sample")`) so that metacells never mix samples.
+Cells are only pooled with cells that share every `group_vars` value; this
+holds for both `method = "random"` and `method = "similarity"`, and scagg
+stops with an error if two groups would ever map to the same metacell ID.
 
 ---
 
@@ -188,6 +191,45 @@ mc_sim = scagg.make_metacells_by_size(
 mc_sim.obs["compactness"]    # mean cell-to-centroid distance per metacell
 # logs: [scagg] median metacell compactness: <x> (random metacells of the same sizes: <y>)
 ```
+
+### Log-normalised input
+
+Sums are only meaningful on counts: adding log values multiplies the
+underlying expression. If you only have log-normalised values,
+`log1p(count / total * scale_factor)` (e.g. `adata.X` after `sc.pp.log1p`, or
+Seurat's `data` layer), pass `from_log=True`. scagg then works in linear space:
+
+```python
+# Recover raw counts, then sum them (usable for DESeq2 / edgeR)
+mc = scagg.make_metacells_by_size(adata, ["cell_type", "sample"], 10,
+                                  from_log=True)
+
+# Or: average normalised profile per metacell, log1p(mean(expm1(x)))
+mc_avg = scagg.make_metacells_by_size(adata, ["cell_type", "sample"], 10,
+                                      from_log=True, mean_normalized=True)
+```
+
+- **Recovered counts** (`from_log=True`, default `mean_normalized=False`):
+  `count = expm1(x) * total / scale_factor`, using each cell's total count
+  from `total_col` (default: `total_counts`, `n_counts` or `nCount_RNA` in
+  Python; `nCount_<assay>` in R). `scale_factor=None` infers the target sum,
+  so Seurat's 1e4 and scanpy's default median target both work. If no totals
+  are stored, scagg prints a message and falls back to the
+  smallest-non-zero trick: every value in a cell is a whole multiple of
+  one count, so the cell is rescaled until all its values are whole numbers.
+  Either way, scagg warns if the recovered values are not close to whole
+  numbers (e.g. the data were scaled or batch-corrected).
+- **Mean normalised profile** (`mean_normalized=True`, only with
+  `from_log=True`): every cell weighs the same regardless of depth. Good for
+  plots and correlations; not counts, so not for count-based DE. In R it is
+  stored in the `data` layer, with no `counts` layer.
+
+`uns["scagg_values"]` records which one you got (`"counts"`,
+`"recovered_counts"` or `"mean_normalized"`). Python warns when the matrix it
+is about to sum has non-integer values and `from_log` is off.
+
+In R, `from_log = TRUE` reads the `data` layer instead of `counts`. It is not
+needed for SCT assays, whose `counts` layer already holds corrected counts.
 
 ### Access results
 
@@ -289,13 +331,16 @@ res <- make_metacells_by_size(
 ### Python
 
 ```
-scagg.make_pseudobulk(adata, group_vars, *, meta_vars, layer, save_membership)
+scagg.make_pseudobulk(adata, group_vars, *, meta_vars, layer, save_membership,
+                      from_log, mean_normalized, total_col, scale_factor)
 scagg.make_metacells_by_size(adata, group_vars, cell_size, *, cell_min, meta_vars,
                               layer, seed, save_membership,
-                              method, use_rep, n_dims, refine, n_init_pcs)
+                              method, use_rep, n_dims, refine, n_init_pcs,
+                              from_log, mean_normalized, total_col, scale_factor)
 scagg.make_metacells_by_num(adata, group_vars, n_metacells, *, min_cells, meta_vars,
                              layer, seed, save_membership,
-                             method, use_rep, n_dims, refine, n_init_pcs)
+                             method, use_rep, n_dims, refine, n_init_pcs,
+                             from_log, mean_normalized, total_col, scale_factor)
 ```
 
 | Parameter | Default | Notes |
@@ -314,21 +359,35 @@ scagg.make_metacells_by_num(adata, group_vars, n_metacells, *, min_cells, meta_v
 | `n_dims` | None (all) | Use only the first N embedding dimensions |
 | `refine` | True | Size-preserving refinement after bisection |
 | `n_init_pcs` | 1 | Try each split from PC1…PCN, keep the tightest (see below) |
+| `from_log` | False | Input is log-normalised; recover raw counts before summing |
+| `mean_normalized` | False | With `from_log`: return `log1p(mean(expm1(x)))` instead |
+| `total_col` | auto | Column with per-cell totals for `from_log` |
+| `scale_factor` | None (infer) | Normalisation target sum for `from_log` |
 
 ### R
 
 ```
 make_pseudobulk(so_obj, group_vars, meta_vars, assays, save_membership,
-                idents_col = NULL)
+                idents_col = NULL, normalize = TRUE, from_log = FALSE,
+                mean_normalized = FALSE, total_col = NULL, scale_factor = NULL)
 make_metacells_by_size(so_obj, group_vars, cell_size, cell_min, meta_vars,
                        assays, seed, save_membership, idents_col = NULL,
                        method = "random", reduction = "pca", n_dims = NULL,
-                       refine = TRUE, n_init_pcs = 1)
+                       refine = TRUE, n_init_pcs = 1, normalize = TRUE,
+                       from_log = FALSE, mean_normalized = FALSE,
+                       total_col = NULL, scale_factor = NULL)
 make_metacells_by_num(so_obj, group_vars, n_metacells, min_cells, meta_vars,
                       assays, seed, save_membership, idents_col = NULL,
                       method = "random", reduction = "pca", n_dims = NULL,
-                      refine = TRUE, n_init_pcs = 1)
+                      refine = TRUE, n_init_pcs = 1, normalize = TRUE,
+                       from_log = FALSE, mean_normalized = FALSE,
+                       total_col = NULL, scale_factor = NULL)
 ```
+
+R results hold the summed raw counts for each assay in `assays` and, with
+`normalize = TRUE` (default), a log-normalised `data` layer. No genes are
+scaled, so memory stays low on large objects; run `ScaleData()` on the genes
+you need.
 
 `idents_col`: name of any column in the result's metadata to set as the active
 Seurat `Idents`. `NULL` (default) leaves Idents unset. The column can be a

@@ -1,8 +1,8 @@
 Package: scagg
 Type: Package
 Title: Pseudobulk and Metacell Aggregation for Single-Cell RNA-seq
-Version: 0.2.0
-Date: 2026-10-15
+Version: 0.3.0
+Date: 2026-10-16
 Authors@R: person("Ethan", "Fenton",
                   email = "ethanfenton27@gmail.com",
                   role  = c("aut", "cre"))
@@ -20,6 +20,9 @@ Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.1
 Imports:
     dplyr,
+    Matrix,
+    methods,
+    SeuratObject (>= 5.0.0),
     stats,
     utils
 Suggests:

@@ -38,6 +38,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="AnnData layer to aggregate (default: X)"),
         sp.add_argument("--save-membership", metavar="CSV",
                         help="Path to save cell → metacell membership CSV"),
+        sp.add_argument("--from-log", action="store_true",
+                        help="Input is log-normalised; recover raw counts before "
+                             "summing"),
+        sp.add_argument("--mean-normalized", action="store_true",
+                        help="With --from-log: output log1p of the mean normalised "
+                             "profile instead of summed counts"),
+        sp.add_argument("--total-col", metavar="COL",
+                        help="obs column with per-cell total counts for --from-log "
+                             "(default: total_counts, n_counts or nCount_RNA)"),
+        sp.add_argument("--scale-factor", type=float, metavar="X",
+                        help="Normalisation target sum for --from-log "
+                             "(default: inferred)"),
     )
 
     def _add_method(sp):
@@ -111,6 +123,10 @@ def main(argv: list[str] | None = None) -> None:
         meta_vars=args.meta_vars,
         layer=args.layer,
         save_membership=args.save_membership,
+        from_log=args.from_log,
+        mean_normalized=args.mean_normalized,
+        total_col=args.total_col,
+        scale_factor=args.scale_factor,
     )
 
     if args.command == "pseudobulk":
