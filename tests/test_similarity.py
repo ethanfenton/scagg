@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from scagg import make_metacells_by_size, make_metacells_by_num
+from scagg import make_metacells_by_size, make_metacells_by_num, make_pseudobulk
 from scagg._partition import balanced_partition
 
 
@@ -155,3 +155,39 @@ def test_n_init_pcs_validated(clustered_adata):
     with pytest.raises(ValueError, match="n_init_pcs"):
         make_metacells_by_size(clustered_adata, ["sample"], 10,
                                method="similarity", n_init_pcs=0)
+
+
+def test_similarity_never_mixes_sample_or_cell_type(clustered_adata):
+    # The same subclusters appear in both samples, so mixing would be tempting.
+    a = clustered_adata
+    a.obs["cell_type"] = np.where(a.obs["subcluster"].isin(["0", "1"]), "A", "B")
+    for res in (
+        make_metacells_by_size(a, ["cell_type", "sample"], 10, method="similarity"),
+        make_metacells_by_num(a, ["cell_type", "sample"], 4, method="similarity"),
+        make_metacells_by_size(a, ["sample"], 10, method="similarity"),
+    ):
+        m = res.uns["metacell_membership"]
+        m = m[m["metacell_id"] != "unassigned"]
+        for col in res.uns["scagg_group_vars"]:
+            assert (m.groupby("metacell_id")[col].nunique() == 1).all()
+
+
+def test_colliding_group_ids_rejected(clustered_adata):
+    a = clustered_adata
+    a.obs["cell_type"] = np.tile(["A_1", "A"], len(a) // 2)
+    a.obs["sample"] = np.tile(["x", "1_x"], len(a) // 2)
+    with pytest.raises(ValueError, match="different"):
+        make_metacells_by_size(a, ["cell_type", "sample"], 10)
+    with pytest.raises(ValueError, match="different"):
+        make_pseudobulk(a, ["cell_type", "sample"])
+
+
+def test_sums_match_membership_sparse_input(clustered_adata):
+    from scipy.sparse import csr_matrix
+    a = clustered_adata
+    a.layers["counts"] = csr_matrix(a.X)
+    res = make_metacells_by_size(a, ["sample"], 7, method="similarity", layer="counts")
+    m = res.uns["metacell_membership"]
+    for mc_id in res.obs_names:
+        cells = m.index[m["metacell_id"] == mc_id]
+        assert np.allclose(res[mc_id].X.ravel(), a[cells].X.sum(axis=0))

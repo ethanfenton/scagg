@@ -6,4 +6,6 @@ export(make_pseudobulk)
 
 importFrom(dplyr, left_join)
 importFrom(stats, dist, median, setNames)
+importFrom(Matrix, sparseMatrix)
+importFrom(methods, as, slot)
 importFrom(utils, write.csv)

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.0 — 2026-10-16
+
+### Added
+- `from_log` (CLI `--from-log`): aggregate log-normalised input,
+  `log1p(count / total * scale_factor)`. Raw counts are recovered as
+  `expm1(x) * total / scale_factor` from each cell's stored total
+  (`total_col`; `scale_factor` inferred unless given), then summed. Without
+  stored totals, scagg prints a message and falls back to the
+  smallest-non-zero trick, extended to cells with no count of exactly 1. A
+  warning is raised if the recovered values are not close to whole numbers.
+  In R this reads the `data` layer.
+- `mean_normalized` (CLI `--mean-normalized`), only with `from_log`: return
+  `log1p(mean(expm1(x)))` per metacell instead of summed counts.
+- `uns["scagg_values"]` (Python) records whether `X` holds counts, recovered
+  counts or mean normalised values. Python warns when the matrix being summed
+  has non-integer values and `from_log` is off.
+
+### Fixed
+- R: aggregation no longer goes through
+  `Seurat::AggregateExpression(return.seurat = TRUE)`, which copied the whole
+  object with `subset()` and ran `ScaleData()` on every gene (more than 32 GB
+  on large objects). Counts are now summed directly with a sparse indicator
+  product, including across split Seurat v5 `counts.*` layers. Summed counts
+  are unchanged; on a 100k-cell × 20k-gene test object, peak memory fell from
+  10.3 GB to 5.9 GB (most of that is the input object) and run time from
+  22 s to 5 s.
+- Metacells could silently pool cells from different samples or cell types
+  when group values containing `_` joined to the same ID (e.g. `("A_1", "x")`
+  and `("A", "1_x")` both give `A_1_x`). All functions now check that every
+  metacell holds cells from a single `group_vars` combination and stop with
+  an error otherwise.
+- Python: summing per metacell is one sparse product instead of a loop over
+  metacells (which was quadratic), and no longer copies the input. Output is
+  unchanged.
+
+### Changed
+- R: the result has a log-normalised `data` layer but no `scale.data`; run
+  `ScaleData()` on the genes you need. New `normalize` argument
+  (default `TRUE`); `normalize = FALSE` returns counts only.
+- R: column names of the result are now the original metacell IDs
+  (`mc1_A_s1`) instead of Seurat's renamed form (`mc1-A-s1`), so they match
+  `metacell_id` and the membership table.
+
 ## 0.2.0 — 2026-10-15
 
 ### Added

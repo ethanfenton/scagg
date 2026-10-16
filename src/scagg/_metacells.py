@@ -3,7 +3,8 @@ AnnData-based metacell and pseudobulk creation.
 
 All three public functions return an AnnData where:
   - obs     = one row per metacell / pseudobulk sample
-  - X       = summed counts
+  - X       = summed counts (or, with mean_normalized=True, the log1p of the
+              mean normalised profile); uns['scagg_values'] says which
   - uns['metacell_membership'] = DataFrame mapping every input cell to its group
 """
 
@@ -21,9 +22,16 @@ from ._aggregate import (
     _assign_by_size,
     _assign_pseudobulk,
     _aggregate_metadata,
+    _check_metacell_purity,
     _default_cell_min,
     _membership_table,
     _sum_by_group,
+)
+from ._lognorm import (
+    check_value_args as _check_value_args,
+    expm1 as _expm1,
+    recover_counts as _recover_counts,
+    warn_if_not_counts as _warn_if_not_counts,
 )
 from ._partition import compactness as _compactness
 
@@ -37,6 +45,10 @@ def make_pseudobulk(
     meta_vars: Sequence[str] | None = None,
     layer: str | None = None,
     save_membership: str | Path | None = None,
+    from_log: bool = False,
+    mean_normalized: bool = False,
+    total_col: str | None = None,
+    scale_factor: float | None = None,
 ) -> ad.AnnData:
     """Aggregate all cells that share the same values of *group_vars* into one
     pseudobulk sample.
@@ -57,6 +69,24 @@ def make_pseudobulk(
         Which layer to sum. ``None`` = use ``adata.X``.
     save_membership:
         If given, save the cell → pseudobulk mapping CSV to this path.
+    from_log:
+        ``True`` if the matrix (*layer* or ``X``) holds log-normalised values,
+        ``log1p(count / total * scale_factor)``.  They are converted back to
+        raw counts before summing: ``count = expm1(x) * total / scale_factor``
+        with each cell's total from *total_col*.  If no totals are found,
+        each cell's smallest non-zero value is taken as a count of 1 (a
+        message says so).  Default ``False``: the matrix is summed as is.
+    mean_normalized:
+        Only with ``from_log=True``.  Instead of recovering counts, return
+        ``log1p(mean(expm1(x)))`` per metacell: the average normalised
+        profile in linear space, re-logged.  Every cell weighs the same
+        regardless of depth.  Not counts, so not for DESeq2 / edgeR.
+    total_col:
+        obs column with each cell's total count.  ``None`` tries
+        ``"total_counts"``, ``"n_counts"`` and ``"nCount_RNA"``.
+    scale_factor:
+        Target sum used in normalisation (Seurat: 1e4).  ``None`` infers it
+        from the data, which also handles scanpy's default median target.
 
     Returns
     -------
@@ -66,6 +96,7 @@ def make_pseudobulk(
     if isinstance(group_vars, str):
         group_vars = [group_vars]
     group_vars = list(group_vars)
+    _check_value_args(from_log, mean_normalized)
 
     obs = adata.obs.copy()
     obs = _assign_pseudobulk(obs, group_vars, metacell_col="metacell_id")
@@ -77,6 +108,8 @@ def make_pseudobulk(
         meta_vars=meta_vars,
         layer=layer,
         save_membership=save_membership,
+        values=dict(from_log=from_log, mean_normalized=mean_normalized,
+                    total_col=total_col, scale_factor=scale_factor),
         strategy="pseudobulk",
     )
 
@@ -96,6 +129,10 @@ def make_metacells_by_size(
     n_dims: int | None = None,
     refine: bool = True,
     n_init_pcs: int = 1,
+    from_log: bool = False,
+    mean_normalized: bool = False,
+    total_col: str | None = None,
+    scale_factor: float | None = None,
 ) -> ad.AnnData:
     """Aggregate cells into metacells of approximately *cell_size* cells.
 
@@ -147,6 +184,24 @@ def make_metacells_by_size(
         PC1 only; ``3`` helps when a broad gradient dominates PC1 but
         distinct sub-states separate along a later PC.  Cost grows roughly
         linearly with *n_init_pcs*.
+    from_log:
+        ``True`` if the matrix (*layer* or ``X``) holds log-normalised values,
+        ``log1p(count / total * scale_factor)``.  They are converted back to
+        raw counts before summing: ``count = expm1(x) * total / scale_factor``
+        with each cell's total from *total_col*.  If no totals are found,
+        each cell's smallest non-zero value is taken as a count of 1 (a
+        message says so).  Default ``False``: the matrix is summed as is.
+    mean_normalized:
+        Only with ``from_log=True``.  Instead of recovering counts, return
+        ``log1p(mean(expm1(x)))`` per metacell: the average normalised
+        profile in linear space, re-logged.  Every cell weighs the same
+        regardless of depth.  Not counts, so not for DESeq2 / edgeR.
+    total_col:
+        obs column with each cell's total count.  ``None`` tries
+        ``"total_counts"``, ``"n_counts"`` and ``"nCount_RNA"``.
+    scale_factor:
+        Target sum used in normalisation (Seurat: 1e4).  ``None`` infers it
+        from the data, which also handles scanpy's default median target.
 
     Returns
     -------
@@ -157,6 +212,7 @@ def make_metacells_by_size(
     if isinstance(group_vars, str):
         group_vars = [group_vars]
     group_vars = list(group_vars)
+    _check_value_args(from_log, mean_normalized)
 
     if cell_min is None:
         cell_min = _default_cell_min(cell_size)
@@ -176,6 +232,8 @@ def make_metacells_by_size(
         meta_vars=meta_vars,
         layer=layer,
         save_membership=save_membership,
+        values=dict(from_log=from_log, mean_normalized=mean_normalized,
+                    total_col=total_col, scale_factor=scale_factor),
         strategy=_strategy_name(f"by_size_{cell_size}", method),
         emb=emb,
         seed=seed,
@@ -197,6 +255,10 @@ def make_metacells_by_num(
     n_dims: int | None = None,
     refine: bool = True,
     n_init_pcs: int = 1,
+    from_log: bool = False,
+    mean_normalized: bool = False,
+    total_col: str | None = None,
+    scale_factor: float | None = None,
 ) -> ad.AnnData:
     """Aggregate cells into exactly *n_metacells* metacells per group.
 
@@ -245,6 +307,24 @@ def make_metacells_by_num(
         PC1 only; ``3`` helps when a broad gradient dominates PC1 but
         distinct sub-states separate along a later PC.  Cost grows roughly
         linearly with *n_init_pcs*.
+    from_log:
+        ``True`` if the matrix (*layer* or ``X``) holds log-normalised values,
+        ``log1p(count / total * scale_factor)``.  They are converted back to
+        raw counts before summing: ``count = expm1(x) * total / scale_factor``
+        with each cell's total from *total_col*.  If no totals are found,
+        each cell's smallest non-zero value is taken as a count of 1 (a
+        message says so).  Default ``False``: the matrix is summed as is.
+    mean_normalized:
+        Only with ``from_log=True``.  Instead of recovering counts, return
+        ``log1p(mean(expm1(x)))`` per metacell: the average normalised
+        profile in linear space, re-logged.  Every cell weighs the same
+        regardless of depth.  Not counts, so not for DESeq2 / edgeR.
+    total_col:
+        obs column with each cell's total count.  ``None`` tries
+        ``"total_counts"``, ``"n_counts"`` and ``"nCount_RNA"``.
+    scale_factor:
+        Target sum used in normalisation (Seurat: 1e4).  ``None`` infers it
+        from the data, which also handles scanpy's default median target.
 
     Returns
     -------
@@ -255,6 +335,7 @@ def make_metacells_by_num(
     if isinstance(group_vars, str):
         group_vars = [group_vars]
     group_vars = list(group_vars)
+    _check_value_args(from_log, mean_normalized)
 
     if min_cells is None:
         min_cells = n_metacells
@@ -274,6 +355,8 @@ def make_metacells_by_num(
         meta_vars=meta_vars,
         layer=layer,
         save_membership=save_membership,
+        values=dict(from_log=from_log, mean_normalized=mean_normalized,
+                    total_col=total_col, scale_factor=scale_factor),
         strategy=_strategy_name(f"by_num_{n_metacells}", method),
         emb=emb,
         seed=seed,
@@ -358,7 +441,9 @@ def _build_result(
     strategy: str,
     emb: np.ndarray | None = None,
     seed: int = 42,
+    values: dict | None = None,
 ) -> ad.AnnData:
+    _check_metacell_purity(obs_with_mc, group_vars)
     assigned = obs_with_mc[obs_with_mc["metacell_id"] != "unassigned"]
     n_unassigned = len(obs_with_mc) - len(assigned)
     if n_unassigned > 0:
@@ -379,9 +464,24 @@ def _build_result(
 
     membership = _membership_table(obs_with_mc, "metacell_id")
 
-    X = adata[assigned.index].X if layer is None else adata[assigned.index].layers[layer]
-    mc_ids = assigned["metacell_id"].values
+    # Sum straight from the full matrix (no subset copy); unassigned rows are skipped.
+    values = values or {}
+    X = adata.X if layer is None else adata.layers[layer]
+    if values.get("mean_normalized"):
+        X, value_kind = _expm1(X), "mean_normalized"
+    elif values.get("from_log"):
+        X = _recover_counts(X, adata.obs, values.get("total_col"),
+                            values.get("scale_factor"))
+        value_kind = "recovered_counts"
+    else:
+        _warn_if_not_counts(X)
+        value_kind = "counts"
+    mc_ids = obs_with_mc["metacell_id"].to_numpy(dtype=object).copy()
+    mc_ids[mc_ids == "unassigned"] = None
     unique_ids, agg_X = _sum_by_group(X, mc_ids)
+    if value_kind == "mean_normalized":
+        sizes = pd.Series(mc_ids).value_counts().reindex(unique_ids).to_numpy()
+        agg_X = np.log1p(agg_X / sizes[:, None])
 
     if meta_vars is None:
         meta_vars_list = [c for c in adata.obs.columns if c not in group_vars]
@@ -401,6 +501,7 @@ def _build_result(
     new_adata.uns["metacell_membership"] = membership
     new_adata.uns["scagg_strategy"] = strategy
     new_adata.uns["scagg_group_vars"] = group_vars
+    new_adata.uns["scagg_values"] = value_kind
 
     if save_membership is not None:
         path = Path(save_membership)
